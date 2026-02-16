@@ -43,7 +43,10 @@ TODOIST_API_KEY = os.environ["TODOIST_API_KEY"]
 TODOIST_API = "https://api.todoist.com/rest/v2/tasks"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
-llm_model = "google/gemini-2.5-flash-lite-preview-09-2025"
+# Model must support structured outputs via OpenRouter.
+# Known good: openai/gpt-4.1-mini, openai/gpt-4.1-nano, openai/gpt-4o-mini
+# Gemini models have issues with nullable schema types through OpenRouter's compatibility layer.
+OPENROUTER_MODEL = "openai/gpt-5-mini"
 
 # Pending confirmations: { batch_id: { "tasks": [...], "chat_id": int } }
 pending: dict[str, dict] = {}
@@ -123,17 +126,17 @@ TASK_SCHEMA = {
                         "description": "Extended notes for the task. Empty string if none.",
                     },
                     "due_string": {
-                        "type": ["string", "null"],
-                        "description": "Natural language due date, e.g. 'tomorrow at 3pm', 'every monday', 'Jan 15'. Null if none.",
+                        "type": "string",
+                        "description": "Natural language due date, e.g. 'tomorrow at 3pm', 'every monday', 'Jan 15'. Empty string if none.",
                     },
-                    "duration": {
-                        "type": ["object", "null"],
-                        "properties": {
-                            "amount": {"type": "integer"},
-                            "unit": {"type": "string", "enum": ["minute", "day"]},
-                        },
-                        "required": ["amount", "unit"],
-                        "description": "Estimated duration. Null if not specified.",
+                    "duration_amount": {
+                        "type": "integer",
+                        "description": "Estimated duration amount. 0 if not specified.",
+                    },
+                    "duration_unit": {
+                        "type": "string",
+                        "enum": ["minute", "day"],
+                        "description": "Duration unit. 'minute' by default.",
                     },
                     "labels": {
                         "type": "array",
@@ -146,7 +149,7 @@ TASK_SCHEMA = {
                         "description": "Priority 1 (normal) to 4 (urgent). Default 1.",
                     },
                 },
-                "required": ["content", "description", "due_string", "duration", "labels", "priority"],
+                "required": ["content", "description", "due_string", "duration_amount", "duration_unit", "labels", "priority"],
                 "additionalProperties": False,
             },
         }
@@ -162,8 +165,9 @@ Your job: parse ALL visible tasks, events, deadlines, and action items into stru
 Rules:
 - content: concise task title. Use markdown if the user implies links.
 - description: any extra context or notes. For events extracted from images, include relevant details like location, time, speaker, etc. Empty string if none.
-- due_string: natural language date/time string Todoist can parse (e.g. "tomorrow", "every friday at 5pm", "Jan 20 at noon", "Feb 15 2025 at 2pm"). Use full dates when visible in images. Null if no date mentioned.
-- duration: if duration or time range is visible (e.g. "2:00 PM - 3:30 PM" → 90 minutes), extract it. Null otherwise.
+- due_string: natural language date/time string Todoist can parse (e.g. "tomorrow", "every friday at 5pm", "Jan 20 at noon", "Feb 15 2025 at 2pm"). Use full dates when visible in images. Empty string if no date mentioned.
+- duration_amount: integer, how long the task takes. 0 if not specified.
+- duration_unit: "minute" or "day". Default "minute".
 - labels: extract any tags, categories, or labels mentioned or implied by context (e.g. "work", "school", "personal"). Empty array if none.
 - priority: 4 = urgent/critical, 3 = high, 2 = medium, 1 = normal (default). Infer from language like "urgent", "important", "ASAP", "low priority", etc.
 
@@ -190,7 +194,7 @@ async def parse_tasks_via_llm(text: str | None = None, image_bytes: bytes | None
     user_content.append({"type": "text", "text": prompt})
 
     payload = {
-        "model": llm_model,
+        "model": OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
@@ -206,16 +210,21 @@ async def parse_tasks_via_llm(text: str | None = None, image_bytes: bytes | None
         "temperature": 0.1,
     }
 
-    resp = await request_with_retry(
-        openrouter_client,
-        "POST",
-        OPENROUTER_API,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-    )
+    try:
+        resp = await request_with_retry(
+            openrouter_client,
+            "POST",
+            OPENROUTER_API,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+    except httpx.HTTPStatusError as e:
+        body = e.response.text
+        log.error(f"OpenRouter HTTP {e.response.status_code}:\n{body}")
+        raise ValueError(f"OpenRouter {e.response.status_code}. Check logs.")
 
     data = resp.json()
     raw_content = data["choices"][0]["message"]["content"]
@@ -245,23 +254,27 @@ async def create_todoist_task(task: dict) -> dict:
     if task.get("due_string"):
         body["due_string"] = task["due_string"]
 
-    if task.get("duration"):
-        body["duration"] = task["duration"]["amount"]
-        body["duration_unit"] = task["duration"]["unit"]
+    if task.get("duration_amount", 0) > 0:
+        body["duration"] = task["duration_amount"]
+        body["duration_unit"] = task.get("duration_unit", "minute")
 
     if task.get("labels"):
         body["labels"] = task["labels"]
 
-    resp = await request_with_retry(
-        todoist_client,
-        "POST",
-        TODOIST_API,
-        headers={
-            "Authorization": f"Bearer {TODOIST_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=body,
-    )
+    try:
+        resp = await request_with_retry(
+            todoist_client,
+            "POST",
+            TODOIST_API,
+            headers={
+                "Authorization": f"Bearer {TODOIST_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+    except httpx.HTTPStatusError as e:
+        log.error(f"Todoist HTTP {e.response.status_code}:\n{e.response.text}")
+        raise
 
     return resp.json()
 
@@ -279,8 +292,8 @@ def format_preview(tasks: list[dict]) -> str:
         details = []
         if t.get("due_string"):
             details.append(f"📅 {t['due_string']}")
-        if t.get("duration"):
-            details.append(f"⏱ {t['duration']['amount']}{t['duration']['unit'][0]}")
+        if t.get("duration_amount", 0) > 0:
+            details.append(f"⏱ {t['duration_amount']}{t.get('duration_unit', 'minute')[0]}")
         if t.get("labels"):
             details.append(f"🏷 {', '.join(t['labels'])}")
         if t.get("description"):
