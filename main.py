@@ -43,6 +43,8 @@ TODOIST_API_KEY = os.environ["TODOIST_API_KEY"]
 TODOIST_API = "https://api.todoist.com/rest/v2/tasks"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
+llm_model = "google/gemini-2.5-flash-lite-preview-09-2025"
+
 # Pending confirmations: { batch_id: { "tasks": [...], "chat_id": int } }
 pending: dict[str, dict] = {}
 
@@ -188,7 +190,7 @@ async def parse_tasks_via_llm(text: str | None = None, image_bytes: bytes | None
     user_content.append({"type": "text", "text": prompt})
 
     payload = {
-        "model": "google/gemini-2.5-flash",
+        "model": llm_model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
