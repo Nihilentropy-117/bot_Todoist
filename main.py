@@ -40,13 +40,13 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 TODOIST_API_KEY = os.environ["TODOIST_API_KEY"]
 
-TODOIST_API = "https://api.todoist.com/rest/v2/tasks"
+TODOIST_API = "https://api.todoist.com/api/v1/tasks"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 # Model must support structured outputs via OpenRouter.
 # Known good: openai/gpt-4.1-mini, openai/gpt-4.1-nano, openai/gpt-4o-mini
 # Gemini models have issues with nullable schema types through OpenRouter's compatibility layer.
-OPENROUTER_MODEL = "openai/gpt-5-mini"
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
 
 # Pending confirmations: { batch_id: { "tasks": [...], "chat_id": int } }
 pending: dict[str, dict] = {}
@@ -255,8 +255,10 @@ async def create_todoist_task(task: dict) -> dict:
         body["due_string"] = task["due_string"]
 
     if task.get("duration_amount", 0) > 0:
-        body["duration"] = task["duration_amount"]
-        body["duration_unit"] = task.get("duration_unit", "minute")
+        body["duration"] = {
+            "amount": task["duration_amount"],
+            "unit": task.get("duration_unit", "minute"),
+        }
 
     if task.get("labels"):
         body["labels"] = task["labels"]
