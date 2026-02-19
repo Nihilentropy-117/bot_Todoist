@@ -21,6 +21,7 @@ import base64
 import logging
 import asyncio
 import uuid
+import hmac
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -39,6 +40,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 TODOIST_API_KEY = os.environ["TODOIST_API_KEY"]
+REGISTRATION_PASSWORD = os.environ["REGISTRATION_PASSWORD"]
 
 TODOIST_API = "https://api.todoist.com/api/v1/tasks"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
@@ -48,8 +50,11 @@ OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 # Gemini models have issues with nullable schema types through OpenRouter's compatibility layer.
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
 
-# Pending confirmations: { batch_id: { "tasks": [...], "chat_id": int } }
+# Pending confirmations: { batch_id: { "tasks": [...], "chat_id": int, "user_id": int } }
 pending: dict[str, dict] = {}
+
+# Registered users: { (chat_id, user_id): {"username": str} }
+registered: dict[tuple[int, int], dict] = {}
 
 # Shared HTTP clients (created at startup, closed at shutdown)
 openrouter_client: httpx.AsyncClient | None = None
@@ -312,12 +317,58 @@ def format_preview(tasks: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+# ─── Registration ────────────────────────────────────────────────────────────
+
+
+def is_registered(chat_id: int, user_id: int) -> bool:
+    return (chat_id, user_id) in registered
+
+
+async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /register <password>. Stores username + chat_id for the sender."""
+    msg = update.message
+    user = msg.from_user
+    chat_id = msg.chat_id
+    user_id = user.id
+
+    if is_registered(chat_id, user_id):
+        await msg.reply_text("You are already registered in this chat.")
+        return
+
+    if not context.args:
+        await msg.reply_text("Usage: /register <password>")
+        return
+
+    provided = " ".join(context.args)
+
+    # Best-effort delete of the message to avoid exposing the password in chat
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    # Constant-time comparison to prevent timing attacks
+    if not hmac.compare_digest(provided, REGISTRATION_PASSWORD):
+        await context.bot.send_message(chat_id, "Incorrect password.")
+        return
+
+    username = user.username or user.full_name or str(user_id)
+    registered[(chat_id, user_id)] = {"username": username}
+    log.info(f"Registered user {username!r} (id={user_id}) in chat {chat_id}")
+    await context.bot.send_message(chat_id, f"Registered successfully. Welcome, {username}!")
+
+
 # ─── Handlers ────────────────────────────────────────────────────────────────
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Parse input → show preview → wait for confirmation."""
     msg = update.message
+
+    if not is_registered(msg.chat_id, msg.from_user.id):
+        await msg.reply_text("You must register first. Use /register <password>.")
+        return
+
     text = msg.text or msg.caption or None
     image_bytes = None
 
@@ -344,7 +395,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Store pending batch and show preview with inline buttons
     batch_id = uuid.uuid4().hex[:12]
-    pending[batch_id] = {"tasks": tasks, "chat_id": msg.chat_id}
+    pending[batch_id] = {"tasks": tasks, "chat_id": msg.chat_id, "user_id": msg.from_user.id}
 
     preview = format_preview(tasks)
     keyboard = InlineKeyboardMarkup([
@@ -366,11 +417,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     action, batch_id = query.data.split(":", 1)
-    batch = pending.pop(batch_id, None)
+    batch = pending.get(batch_id)
 
     if not batch:
         await query.edit_message_text("⚠️ This batch expired or was already processed.")
         return
+
+    # Only the user who created the batch may act on it
+    if query.from_user.id != batch["user_id"]:
+        await query.answer("This confirmation is not for you.", show_alert=True)
+        return
+
+    pending.pop(batch_id, None)
 
     if action == "cancel":
         await query.edit_message_text("🚫 Cancelled. No tasks created.")
@@ -399,7 +457,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me tasks as text, a screenshot, or both.\n"
+        "Welcome! First, register with:\n"
+        "  /register <password>\n\n"
+        "Once registered, send me tasks as text, a screenshot, or both.\n"
         "I'll parse them, show a preview, and wait for your confirmation.\n\n"
         "Examples:\n"
         "• Buy groceries tomorrow\n"
@@ -438,6 +498,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("register", register))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
