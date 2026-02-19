@@ -334,10 +334,13 @@ async def fetch_today_tasks() -> list[dict]:
     """Fetch tasks due today (and overdue) from Todoist."""
     resp = await request_with_retry(
         todoist_client,
-        "GET",
+        "POST",
         TODOIST_FILTER_API,
-        headers={"Authorization": f"Bearer {TODOIST_API_KEY}"},
-        params={"query": "today | overdue", "limit": 200},
+        headers={
+            "Authorization": f"Bearer {TODOIST_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"query": "today | overdue", "limit": 200},
     )
     data = resp.json()
     if isinstance(data, list):
