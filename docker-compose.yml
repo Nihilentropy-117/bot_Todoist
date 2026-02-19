@@ -8,6 +8,7 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - TODOIST_API_KEY=${TODOIST_API_KEY}
+      - REGISTRATION_PASSWORD=${REGISTRATION_PASSWORD}
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
       interval: 30s
