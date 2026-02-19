@@ -5,6 +5,7 @@ Features:
   - Multimodal input (text, image, or both)
   - Structured output via OpenRouter
   - Confirmation preview before creating tasks
+  - Daily task reminders at 08:00 (configurable timezone)
   - Retries with exponential backoff
   - Rate limit awareness
   - Shared HTTP clients
@@ -13,6 +14,10 @@ Env vars required:
     TELEGRAM_BOT_TOKEN
     OPENROUTER_API_KEY
     TODOIST_API_KEY
+    REGISTRATION_PASSWORD
+Optional:
+    REMINDER_TIMEZONE   – IANA timezone for daily reminders (default: UTC)
+    OPENROUTER_MODEL    – LLM model to use via OpenRouter
 """
 
 import os
@@ -22,6 +27,8 @@ import logging
 import asyncio
 import uuid
 import hmac
+import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -43,7 +50,10 @@ TODOIST_API_KEY = os.environ["TODOIST_API_KEY"]
 REGISTRATION_PASSWORD = os.environ["REGISTRATION_PASSWORD"]
 
 TODOIST_API = "https://api.todoist.com/api/v1/tasks"
+TODOIST_FILTER_API = "https://api.todoist.com/api/v1/tasks/filter"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
+
+REMINDER_TIMEZONE = os.environ.get("REMINDER_TIMEZONE", "UTC")
 
 # Model must support structured outputs via OpenRouter.
 # Known good: openai/gpt-4.1-mini, openai/gpt-4.1-nano, openai/gpt-4o-mini
@@ -317,6 +327,107 @@ def format_preview(tasks: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+# ─── Daily reminders ─────────────────────────────────────────────────────────
+
+
+async def fetch_today_tasks() -> list[dict]:
+    """Fetch tasks due today (and overdue) from Todoist."""
+    resp = await request_with_retry(
+        todoist_client,
+        "GET",
+        TODOIST_FILTER_API,
+        headers={"Authorization": f"Bearer {TODOIST_API_KEY}"},
+        params={"query": "today | overdue", "limit": 200},
+    )
+    data = resp.json()
+    if isinstance(data, list):
+        return data
+    return data.get("results", [])
+
+
+def format_daily_task_list(tasks: list[dict]) -> str:
+    """Format Todoist tasks into a readable daily summary message."""
+    if not tasks:
+        return "☀️ Your Day\n\nNo tasks for today. Enjoy your free time!"
+
+    lines = ["☀️ Your tasks for today:", ""]
+
+    for i, task in enumerate(tasks, 1):
+        pri = PRIORITY_LABELS.get(task.get("priority", 1), "")
+        line = f"{i}. {pri} {task['content']}".strip()
+
+        details = []
+        due = task.get("due")
+        if due:
+            if due.get("datetime"):
+                try:
+                    dt = datetime.datetime.fromisoformat(due["datetime"])
+                    details.append(f"🕐 {dt.strftime('%H:%M')}")
+                except ValueError:
+                    details.append(f"🕐 {due['datetime']}")
+            elif due.get("string"):
+                details.append(f"📅 {due['string']}")
+
+        if task.get("labels"):
+            details.append(f"🏷 {', '.join(task['labels'])}")
+        if task.get("description"):
+            desc = task["description"]
+            if len(desc) > 80:
+                desc = desc[:77] + "..."
+            details.append(f"📝 {desc}")
+
+        if details:
+            line += "\n   " + " · ".join(details)
+
+        lines.append(line)
+
+    lines.append("")
+    lines.append(f"📋 {len(tasks)} task(s) total")
+    return "\n".join(lines)
+
+
+async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Job callback: send daily task list to all registered chats."""
+    if not registered:
+        log.info("No registered users. Skipping daily reminder.")
+        return
+
+    try:
+        tasks = await fetch_today_tasks()
+    except Exception:
+        log.exception("Failed to fetch today's tasks for daily reminder")
+        return
+
+    message = format_daily_task_list(tasks)
+
+    # Deduplicate by chat_id so each chat gets one message
+    sent_chats: set[int] = set()
+    for chat_id, _user_id in registered:
+        if chat_id in sent_chats:
+            continue
+        try:
+            await context.bot.send_message(chat_id, message)
+            sent_chats.add(chat_id)
+            log.info(f"Daily reminder sent to chat {chat_id}")
+        except Exception:
+            log.exception(f"Failed to send daily reminder to chat {chat_id}")
+
+
+async def send_task_list_to_chat(bot, chat_id: int):
+    """Fetch today's tasks and send the formatted list to a single chat."""
+    try:
+        tasks = await fetch_today_tasks()
+    except Exception:
+        log.exception("Failed to fetch today's tasks")
+        return
+
+    message = format_daily_task_list(tasks)
+    try:
+        await bot.send_message(chat_id, message)
+    except Exception:
+        log.exception(f"Failed to send task list to chat {chat_id}")
+
+
 # ─── Registration ────────────────────────────────────────────────────────────
 
 
@@ -356,6 +467,9 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     registered[(chat_id, user_id)] = {"username": username}
     log.info(f"Registered user {username!r} (id={user_id}) in chat {chat_id}")
     await context.bot.send_message(chat_id, f"Registered successfully. Welcome, {username}!")
+
+    # Send today's tasks right away so the new user sees their day
+    await send_task_list_to_chat(context.bot, chat_id)
 
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
@@ -472,11 +586,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app):
-    """Create shared HTTP clients on startup."""
+    """Create shared HTTP clients on startup, schedule daily reminders."""
     global openrouter_client, todoist_client
     openrouter_client = httpx.AsyncClient(timeout=45)
     todoist_client = httpx.AsyncClient(timeout=15)
     log.info("HTTP clients initialized.")
+
+    # Schedule daily reminder at 08:00
+    tz = ZoneInfo(REMINDER_TIMEZONE)
+    app.job_queue.run_daily(
+        send_daily_reminder,
+        time=datetime.time(hour=8, minute=0, second=0, tzinfo=tz),
+        name="daily_task_reminder",
+    )
+    log.info(f"Daily reminder scheduled at 08:00 {REMINDER_TIMEZONE}.")
+
+    # Send task list to any already-registered users at boot
+    # (Registration is in-memory so this is empty on a fresh start,
+    #  but will fire if persistence is added later.)
+    if registered:
+        sent_chats: set[int] = set()
+        for chat_id, _user_id in dict(registered):
+            if chat_id not in sent_chats:
+                await send_task_list_to_chat(app.bot, chat_id)
+                sent_chats.add(chat_id)
 
 
 async def post_shutdown(app):
