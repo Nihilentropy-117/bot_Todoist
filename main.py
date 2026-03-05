@@ -331,16 +331,13 @@ def format_preview(tasks: list[dict]) -> str:
 
 
 async def fetch_today_tasks() -> list[dict]:
-    """Fetch tasks due today (and overdue) from Todoist."""
+    """Fetch tasks due today from Todoist."""
     resp = await request_with_retry(
         todoist_client,
-        "POST",
+        "GET",
         TODOIST_FILTER_API,
-        headers={
-            "Authorization": f"Bearer {TODOIST_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={"query": "today | overdue", "limit": 200},
+        headers={"Authorization": f"Bearer {TODOIST_API_KEY}"},
+        params={"query": "today"},
     )
     data = resp.json()
     if isinstance(data, list):
