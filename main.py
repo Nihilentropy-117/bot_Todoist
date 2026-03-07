@@ -66,6 +66,12 @@ pending: dict[str, dict] = {}
 # Registered users: { (chat_id, user_id): {"username": str} }
 registered: dict[tuple[int, int], dict] = {}
 
+# Media group buffer: { media_group_id: { "images": [bytes, ...], "text": str|None, "chat_id": int, "user_id": int } }
+media_group_buffer: dict[str, dict] = {}
+
+# Seconds to wait after the first photo of a group before processing the whole album
+MEDIA_GROUP_DELAY = 2.0
+
 # Shared HTTP clients (created at startup, closed at shutdown)
 openrouter_client: httpx.AsyncClient | None = None
 todoist_client: httpx.AsyncClient | None = None
@@ -194,12 +200,12 @@ Do not invent information. Only extract what's stated or strongly implied."""
 # ─── LLM ────────────────────────────────────────────────────────────────────
 
 
-async def parse_tasks_via_llm(text: str | None = None, image_bytes: bytes | None = None) -> list[dict]:
-    """Send text and/or image to OpenRouter, get structured task list back."""
+async def parse_tasks_via_llm(text: str | None = None, images: list[bytes] | None = None) -> list[dict]:
+    """Send text and/or one or more images to OpenRouter, get structured task list back."""
     user_content = []
 
-    if image_bytes:
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
+    for img_bytes in (images or []):
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
         user_content.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
@@ -475,41 +481,27 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Handlers ────────────────────────────────────────────────────────────────
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Parse input → show preview → wait for confirmation."""
-    msg = update.message
-
-    if not is_registered(msg.chat_id, msg.from_user.id):
-        await msg.reply_text("You must register first. Use /register <password>.")
-        return
-
-    text = msg.text or msg.caption or None
-    image_bytes = None
-
-    if msg.photo:
-        photo = msg.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        image_bytes = await file.download_as_bytearray()
-
-    if not text and not image_bytes:
-        return
-
-    status = await msg.reply_text("⏳ Parsing...")
-
+async def _parse_and_preview(
+    text: str | None,
+    images: list[bytes],
+    chat_id: int,
+    user_id: int,
+    status_msg,
+) -> None:
+    """Parse tasks from text/images and replace status_msg with a confirmation preview."""
     try:
-        tasks = await parse_tasks_via_llm(text=text, image_bytes=image_bytes)
+        tasks = await parse_tasks_via_llm(text=text, images=images or None)
     except Exception as e:
         log.exception("LLM parse failed")
-        await status.edit_text(f"❌ Parse error: {e}")
+        await status_msg.edit_text(f"❌ Parse error: {e}")
         return
 
     if not tasks:
-        await status.edit_text("No tasks found in your message.")
+        await status_msg.edit_text("No tasks found in your message.")
         return
 
-    # Store pending batch and show preview with inline buttons
     batch_id = uuid.uuid4().hex[:12]
-    pending[batch_id] = {"tasks": tasks, "chat_id": msg.chat_id, "user_id": msg.from_user.id}
+    pending[batch_id] = {"tasks": tasks, "chat_id": chat_id, "user_id": user_id}
 
     preview = format_preview(tasks)
     keyboard = InlineKeyboardMarkup([
@@ -519,9 +511,88 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
-    await status.edit_text(
+    await status_msg.edit_text(
         f"Found {len(tasks)} task(s):\n\n{preview}",
         reply_markup=keyboard,
+    )
+
+
+async def _process_media_group(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job callback: fires after MEDIA_GROUP_DELAY to process a fully-collected album."""
+    job_data = context.job.data
+    group_id: str = job_data["group_id"]
+    status_msg = job_data["status_msg"]
+
+    group = media_group_buffer.pop(group_id, None)
+    if not group:
+        return
+
+    n = len(group["images"])
+    await status_msg.edit_text(f"⏳ Parsing {n} image(s)...")
+    await _parse_and_preview(
+        text=group["text"],
+        images=group["images"],
+        chat_id=group["chat_id"],
+        user_id=group["user_id"],
+        status_msg=status_msg,
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Parse input → show preview → wait for confirmation."""
+    msg = update.message
+
+    if not is_registered(msg.chat_id, msg.from_user.id):
+        await msg.reply_text("You must register first. Use /register <password>.")
+        return
+
+    text = msg.text or msg.caption or None
+
+    # ── Media group (album of multiple photos sent at once) ───────────────────
+    if msg.photo and msg.media_group_id:
+        group_id = msg.media_group_id
+        photo = msg.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = bytes(await file.download_as_bytearray())
+
+        if group_id not in media_group_buffer:
+            # First photo of the group — create buffer entry, send status, schedule job
+            media_group_buffer[group_id] = {
+                "images": [],
+                "text": None,
+                "chat_id": msg.chat_id,
+                "user_id": msg.from_user.id,
+            }
+            status = await msg.reply_text("⏳ Collecting images...")
+            context.job_queue.run_once(
+                _process_media_group,
+                when=MEDIA_GROUP_DELAY,
+                data={"group_id": group_id, "status_msg": status},
+                name=f"media_group_{group_id}",
+            )
+
+        media_group_buffer[group_id]["images"].append(image_bytes)
+        if text:
+            media_group_buffer[group_id]["text"] = text
+        return
+
+    # ── Single photo or plain text ────────────────────────────────────────────
+    images: list[bytes] = []
+    if msg.photo:
+        photo = msg.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        images = [bytes(await file.download_as_bytearray())]
+
+    if not text and not images:
+        return
+
+    status = await msg.reply_text("⏳ Parsing...")
+    await _parse_and_preview(
+        text=text,
+        images=images,
+        chat_id=msg.chat_id,
+        user_id=msg.from_user.id,
+        status_msg=status,
     )
 
 
@@ -574,11 +645,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome! First, register with:\n"
         "  /register <password>\n\n"
         "Once registered, send me tasks as text, a screenshot, or both.\n"
-        "I'll parse them, show a preview, and wait for your confirmation.\n\n"
+        "You can also send multiple images at once (as an album) — I'll feed\n"
+        "them all to the model together, whether they're related screenshots\n"
+        "or separate tasks each on their own image.\n"
+        "I'll parse everything, show a preview, and wait for your confirmation.\n\n"
         "Examples:\n"
         "• Buy groceries tomorrow\n"
         "• Write report by Friday, ~2 hours, high priority\n"
-        "• 📸 Screenshot of a calendar, event flyer, or syllabus"
+        "• 📸 One screenshot of a calendar, event flyer, or syllabus\n"
+        "• 📸📸 Multiple screenshots sent as an album"
     )
 
 
