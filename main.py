@@ -211,7 +211,12 @@ async def parse_tasks_via_llm(text: str | None = None, images: list[bytes] | Non
             "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
         })
 
-    prompt = text or "Extract all tasks, events, and deadlines from this image."
+    if images and text:
+        prompt = f"Extract all tasks, events, and deadlines from this image.\n\nUser note: {text}"
+    elif text:
+        prompt = text
+    else:
+        prompt = "Extract all tasks, events, and deadlines from this image."
     user_content.append({"type": "text", "text": prompt})
 
     payload = {
