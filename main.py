@@ -634,8 +634,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             created = await create_todoist_task(task)
             line = f"✅ {created['content']}"
             if created.get("due"):
-                line += f" — {created['due']['string']}"
-            line += f"\n   {created['url']}"
+                due = created["due"]
+                line += f" — {due.get('string') or due.get('date', '')}"
+            task_url = created.get("url")
+            if not task_url and created.get("id"):
+                task_url = f"https://todoist.com/showTask?id={created['id']}"
+            if task_url:
+                line += f"\n   {task_url}"
             results.append(line)
         except Exception as e:
             log.exception(f"Todoist create failed for: {task['content']}")
