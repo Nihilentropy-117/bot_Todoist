@@ -283,10 +283,8 @@ async def create_todoist_task(task: dict) -> dict:
         body["due_string"] = task["due_string"]
 
     if task.get("duration_amount", 0) > 0:
-        body["duration"] = {
-            "amount": task["duration_amount"],
-            "unit": task.get("duration_unit", "minute"),
-        }
+        body["duration"] = task["duration_amount"]
+        body["duration_unit"] = task.get("duration_unit", "minute")
 
     if task.get("labels"):
         body["labels"] = task["labels"]
