@@ -194,6 +194,8 @@ Rules:
 
 For images: read ALL text carefully. Extract every distinct event, deadline, or task visible. Preserve exact dates and times as shown.
 
+When the user provides instructions alongside an image (via caption), follow them. User instructions take priority — they may rename tasks, set specific titles, override labels/priorities, or add context not visible in the image. Always respect the user's explicit requests.
+
 Do not invent information. Only extract what's stated or strongly implied."""
 
 
@@ -212,7 +214,7 @@ async def parse_tasks_via_llm(text: str | None = None, images: list[bytes] | Non
         })
 
     if images and text:
-        prompt = f"Extract all tasks, events, and deadlines from this image.\n\nUser note: {text}"
+        prompt = f"Extract all tasks, events, and deadlines from this image.\n\nUser instructions: {text}\n\nFollow the user's instructions above — they may override titles, labels, priorities, or other fields."
     elif text:
         prompt = text
     else:
