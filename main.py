@@ -22,12 +22,14 @@ Optional:
 
 import os
 import json
+import re
 import base64
 import logging
 import asyncio
 import uuid
 import hmac
 import datetime
+import unicodedata
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -49,8 +51,8 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 TODOIST_API_KEY = os.environ["TODOIST_API_KEY"]
 REGISTRATION_PASSWORD = os.environ["REGISTRATION_PASSWORD"]
 
-TODOIST_API = "https://api.todoist.com/rest/v2/tasks"
-TODOIST_FILTER_API = "https://api.todoist.com/rest/v2/tasks"
+TODOIST_API = "https://api.todoist.com/api/v1/tasks"
+TODOIST_FILTER_API = "https://api.todoist.com/api/v1/tasks/filter"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 REMINDER_TIMEZONE = os.environ.get("REMINDER_TIMEZONE", "UTC")
@@ -269,6 +271,24 @@ async def parse_tasks_via_llm(text: str | None = None, images: list[bytes] | Non
 # ─── Todoist ─────────────────────────────────────────────────────────────────
 
 
+def _slugify(text: str) -> str:
+    """Convert text to a URL-friendly slug, matching Todoist's format."""
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    return re.sub(r"[-\s]+", "-", text).strip("-")
+
+
+def _get_task_url(task_id: str, content: str | None = None) -> str:
+    """Build the Todoist app URL for a task."""
+    if content:
+        slug = _slugify(content)
+        path = f"{slug}-{task_id}" if slug else task_id
+    else:
+        path = task_id
+    return f"https://app.todoist.com/app/task/{path}"
+
+
 async def create_todoist_task(task: dict) -> dict:
     """Create a single task in Todoist via REST API v2."""
     body = {
@@ -348,7 +368,7 @@ async def fetch_today_tasks() -> list[dict]:
         "GET",
         TODOIST_FILTER_API,
         headers={"Authorization": f"Bearer {TODOIST_API_KEY}"},
-        params={"filter": "today"},
+        params={"query": "today"},
     )
     data = resp.json()
     if isinstance(data, list):
@@ -635,8 +655,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             line = f"✅ {created['content']}"
             if created.get("due"):
                 line += f" — {created['due']['string']}"
-            if created.get("url"):
-                line += f"\n   {created['url']}"
+            task_url = _get_task_url(created["id"], created.get("content"))
+            line += f"\n   {task_url}"
             results.append(line)
         except Exception as e:
             log.exception(f"Todoist create failed for: {task['content']}")
