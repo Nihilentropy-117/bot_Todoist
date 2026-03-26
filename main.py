@@ -49,8 +49,8 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 TODOIST_API_KEY = os.environ["TODOIST_API_KEY"]
 REGISTRATION_PASSWORD = os.environ["REGISTRATION_PASSWORD"]
 
-TODOIST_API = "https://api.todoist.com/api/v1/tasks"
-TODOIST_FILTER_API = "https://api.todoist.com/api/v1/tasks/filter"
+TODOIST_API = "https://api.todoist.com/rest/v2/tasks"
+TODOIST_FILTER_API = "https://api.todoist.com/rest/v2/tasks"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 REMINDER_TIMEZONE = os.environ.get("REMINDER_TIMEZONE", "UTC")
@@ -348,7 +348,7 @@ async def fetch_today_tasks() -> list[dict]:
         "GET",
         TODOIST_FILTER_API,
         headers={"Authorization": f"Bearer {TODOIST_API_KEY}"},
-        params={"query": "today"},
+        params={"filter": "today"},
     )
     data = resp.json()
     if isinstance(data, list):
@@ -634,13 +634,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             created = await create_todoist_task(task)
             line = f"✅ {created['content']}"
             if created.get("due"):
-                due = created["due"]
-                line += f" — {due.get('string') or due.get('date', '')}"
-            task_url = created.get("url")
-            if not task_url and created.get("id"):
-                task_url = f"https://todoist.com/showTask?id={created['id']}"
-            if task_url:
-                line += f"\n   {task_url}"
+                line += f" — {created['due']['string']}"
+            if created.get("url"):
+                line += f"\n   {created['url']}"
             results.append(line)
         except Exception as e:
             log.exception(f"Todoist create failed for: {task['content']}")
